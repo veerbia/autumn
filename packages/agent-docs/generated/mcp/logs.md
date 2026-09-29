@@ -171,12 +171,15 @@ where customer_id == 'cus_123' and (request_path contains 'billing' or stripe_ev
 
 ### "Why is this invoice unpaid?"
 
-1. Find the invoice: `listInvoices` with `stripe_id` when you have the `in_...` ID, otherwise with `customer_id` and `status: ["open"]`. Stripe invoice numbers (e.g. `ABCD1234-0003`) are not stored — ask for the `in_...` ID or the customer.
-2. Call `getStripeInvoice` with its `stripe_id`. A failed payment leaves the invoice `open`, so read the payment state rather than the status:
+1. Find the invoice:
+   - an invoice number (e.g. `ABCD1234-0003`, printed on the invoice) → `getStripeInvoice` with `invoice_number`;
+   - a Stripe `in_...` ID → `getStripeInvoice` with `stripe_invoice_id`;
+   - only the customer → `listInvoices` with `customer_id` and `status: ["open"]`, then `getStripeInvoice` with the invoice's `stripe_id`.
+2. Read the payment state from `getStripeInvoice`. A failed payment leaves the invoice `open`, so read the payment state rather than the status:
    - a `payment_intent.last_payment_error` → a charge was attempted and failed; report its `decline_code` / `message`, `attempt_count`, and `next_payment_attempt` (null means Stripe will not retry).
    - `collection_method: send_invoice` → nothing is charged automatically; it waits for the customer to pay the hosted invoice.
    - no payments and `attempted: false` → no charge has been tried yet.
-3. An open invoice cannot be deleted. It can be voided (`voidInvoice`), marked paid out of band (`payInvoice`), or corrected and reissued (`reissueInvoice`); each needs the user's approval.
+3. To act on it, find its Autumn invoice with `listInvoices` and `stripe_id` set to the `id` from `getStripeInvoice`. An open invoice cannot be deleted. It can be voided (`voidInvoice`), marked paid out of band (`payInvoice`), or corrected and reissued (`reissueInvoice`); each needs the user's approval.
 
 ### "Why did their payment change this month?"
 

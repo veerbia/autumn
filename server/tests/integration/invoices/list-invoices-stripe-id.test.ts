@@ -95,3 +95,62 @@ test.concurrent(
 		expect((paymentIntent as Stripe.PaymentIntent).status).toBe("succeeded");
 	},
 );
+
+// Stripe search indexes new invoices with a delay of up to about a minute.
+const SEARCH_INDEX_TIMEOUT_MS = 120_000;
+const SEARCH_POLL_INTERVAL_MS = 5_000;
+
+test.concurrent(
+	`${chalk.yellowBright("GET /invoices/:number/stripe: looks a Stripe invoice up by its number")}`,
+	async () => {
+		const customerId = "inv-stripe-by-number";
+		const pro = products.pro({
+			id: "pro-stripe-by-number",
+			items: [items.monthlyMessages({ includedUsage: 100 })],
+		});
+		const { autumnV2_3 } = await initScenario({
+			customerId,
+			setup: [
+				s.customer({ paymentMethod: "success" }),
+				s.products({ list: [pro] }),
+			],
+			actions: [s.billing.attach({ productId: pro.id })],
+		});
+
+		const {
+			list: [invoice],
+		} = (await autumnV2_3.post("/invoices.list", {
+			customer_id: customerId,
+		})) as { list: ApiListInvoiceV1[] };
+		const byId = (await autumnV2_3.get(
+			`/invoices/${invoice.stripe_id}/stripe`,
+		)) as Stripe.Invoice;
+		expect(byId.number).toBeTruthy();
+
+		const deadline = Date.now() + SEARCH_INDEX_TIMEOUT_MS;
+		let byNumber: Stripe.Invoice | null = null;
+		while (!byNumber) {
+			try {
+				byNumber = (await autumnV2_3.get(
+					`/invoices/${byId.number}/stripe`,
+				)) as Stripe.Invoice;
+			} catch (error) {
+				if (Date.now() > deadline) throw error;
+				await new Promise((resolve) =>
+					setTimeout(resolve, SEARCH_POLL_INTERVAL_MS),
+				);
+			}
+		}
+		expect(byNumber.id).toBe(invoice.stripe_id);
+		expect(typeof byNumber.payments?.data[0]?.payment?.payment_intent).toBe(
+			"object",
+		);
+
+		await expect(
+			autumnV2_3.get("/invoices/ZZZZZZZZ-9999/stripe"),
+		).rejects.toThrow();
+		await expect(
+			autumnV2_3.get(`/invoices/${encodeURIComponent('x" OR 1')}/stripe`),
+		).rejects.toThrow();
+	},
+);

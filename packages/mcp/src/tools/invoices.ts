@@ -62,13 +62,44 @@ const withFixedFields = (
 	fixedFields: Record<string, unknown>,
 ): OperationToolConfig => ({ ...config, fixedFields });
 
+const asRecord = (value: unknown): Record<string, unknown> =>
+	value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+
+/** Keeps only invoices matching the ID filters. An API build that predates a
+ * filter silently drops it and returns unrelated invoices; this turns that into
+ * an empty result instead of a wrong match. */
+export const keepInvoicesMatchingIdFilters = ({
+	request,
+	result,
+}: {
+	request: unknown;
+	result: unknown;
+}) => {
+	const { invoice_id: invoiceId, stripe_id: stripeId } = asRecord(request);
+	const body = asRecord(result);
+	if (!Array.isArray(body.list) || (!invoiceId && !stripeId)) return result;
+
+	const list = body.list.filter((invoice) => {
+		const { id, stripe_id: invoiceStripeId } = asRecord(invoice);
+		return (
+			(!invoiceId || id === invoiceId) &&
+			(!stripeId || invoiceStripeId === stripeId)
+		);
+	});
+	if (list.length === body.list.length) return result;
+	return { ...body, list, next_cursor: null };
+};
+
 const domain = {
 	operations: [
-		operation({
-			id: "listInvoices",
-			description:
-				"List invoices Autumn has recorded, newest first. Filter by customer_id (plus entity_id), stripe_id (a Stripe in_... invoice ID), status (draft, open, paid, void, uncollectible), or processor_types. Stripe invoice numbers (e.g. ABCD1234-0003) are not stored, so ask for the in_... ID or list the customer's invoices instead. Status mirrors Stripe: a failed payment leaves the invoice open. To see why an invoice is unpaid, call getStripeInvoice with its stripe_id. For every/all requests, paginate with start_cursor until next_cursor is null.",
-		}),
+		{
+			...operation({
+				id: "listInvoices",
+				description:
+					"List invoices Autumn has recorded, newest first. Filter by customer_id (plus entity_id), invoice_id (Autumn inv_...), stripe_id (Stripe in_...), status (draft, open, paid, void, uncollectible), or processor_types. There is no filter for a Stripe invoice number (e.g. ABCD1234-0003): call getStripeInvoice with invoice_number, then filter by the stripe_id it returns. Status mirrors Stripe: a failed payment leaves the invoice open. To see why an invoice is unpaid, call getStripeInvoice with its stripe_id. For every/all requests, paginate with start_cursor until next_cursor is null.",
+			}),
+			transformResult: keepInvoicesMatchingIdFilters,
+		},
 		operation({
 			id: "listInvoiceTemplates",
 			description:
@@ -196,14 +227,25 @@ const getStripeInvoiceSchema = z
 		stripe_invoice_id: z
 			.string()
 			.regex(/^in_[A-Za-z0-9]+$/, "Must be a Stripe invoice ID (in_...)")
+			.optional()
 			.meta({ description: "The Stripe invoice ID (in_...)." }),
+		invoice_number: z
+			.string()
+			.regex(
+				/^[A-Za-z0-9-]+$/,
+				"Must be a Stripe invoice number, e.g. ABCD1234-0003",
+			)
+			.optional()
+			.meta({
+				description:
+					"The invoice number printed on the invoice, e.g. ABCD1234-0003.",
+			}),
 	})
 	.strict();
 
 const signalOf = (context: { mcp?: { extra?: { signal?: AbortSignal } } }) =>
 	context?.mcp?.extra?.signal;
 
-/** Built per toolset: the intent and analytics layers mutate tools in place. */
 const getInvoiceSchema = z
 	.object({
 		invoice_id: z.string().meta({
@@ -234,11 +276,12 @@ const getInvoice = async ({
 			signal,
 		}),
 	);
-	const [invoice] = list;
+	const invoice = list.find((row) => asRecord(row).id === invoiceId);
 	if (!invoice) throw new Error(`Invoice ${invoiceId} not found`);
 	return invoice;
 };
 
+/** Built per toolset: the intent and analytics layers mutate tools in place. */
 export const createInvoiceTools = () => ({
 	getInvoice: createTool({
 		id: "getInvoice",
@@ -256,17 +299,31 @@ export const createInvoiceTools = () => ({
 	getStripeInvoice: createTool({
 		id: "getStripeInvoice",
 		description:
-			"Fetch the live payment state of one invoice from Stripe by its in_... ID (from listInvoices or getCustomer invoices). Returns status, collection_method, attempt_count, next_payment_attempt, and each payment's payment_intent with last_payment_error (decline code and message). Use it to explain why an invoice is open or unpaid: a last_payment_error means a charge was attempted and failed; collection_method send_invoice means it waits for the customer to pay manually.",
+			"Fetch the live payment state of one invoice from Stripe, by its in_... ID (stripe_invoice_id, from listInvoices or getCustomer invoices) or by the invoice number printed on it (invoice_number, e.g. ABCD1234-0003). Returns id, number, status, collection_method, attempt_count, next_payment_attempt, and each payment's payment_intent with last_payment_error (decline code and message). Use it to explain why an invoice is open or unpaid: a last_payment_error means a charge was attempted and failed; collection_method send_invoice means it waits for the customer to pay manually. To act on it in Autumn, pass the returned id as stripe_id to listInvoices.",
 		inputSchema: getStripeInvoiceSchema,
 		mcp: { annotations: mcpAnnotations() },
-		execute: async ({ stripe_invoice_id }, context) =>
-			summarizeStripeInvoice(
+		execute: async ({ stripe_invoice_id, invoice_number }, context) => {
+			// Checked here, not as a schema refinement: the toolset extends every
+			// input schema with `intent`, and extending drops refinements.
+			if (Boolean(stripe_invoice_id) === Boolean(invoice_number)) {
+				throw new Error(
+					"Pass exactly one of stripe_invoice_id or invoice_number.",
+				);
+			}
+			const lookup = stripe_invoice_id ?? invoice_number ?? "";
+			const summary = summarizeStripeInvoice(
 				await callAutumnGet({
 					auth: getAutumnAuth(context),
-					endpoint: `/v1/invoices/${stripe_invoice_id}/stripe`,
+					endpoint: `/v1/invoices/${encodeURIComponent(lookup)}/stripe`,
 					signal: signalOf(context),
 				}),
-			),
+			);
+			const matches = stripe_invoice_id
+				? summary.id === stripe_invoice_id
+				: summary.number === invoice_number;
+			if (!matches) throw new Error(`Stripe invoice ${lookup} not found`);
+			return summary;
+		},
 	}),
 });
 

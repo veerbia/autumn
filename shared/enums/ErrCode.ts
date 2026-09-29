@@ -120,6 +120,7 @@ export const ErrCode = {
 
 	// Invoice
 	CreateInvoiceFailed: "create_invoice_failed",
+	InvoiceNotFound: "invoice_not_found",
 
 	// Event
 	InvalidEvent: "invalid_event",

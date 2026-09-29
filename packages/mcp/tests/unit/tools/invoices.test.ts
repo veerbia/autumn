@@ -3,6 +3,7 @@ import { InvoiceStatus } from "@autumn/shared";
 import { createRawAutumnOperationTools } from "../../../src/tools/index.js";
 import {
 	invoices,
+	keepInvoicesMatchingIdFilters,
 	summarizeStripeInvoice,
 } from "../../../src/tools/invoices.js";
 
@@ -193,4 +194,95 @@ test("getInvoice looks the invoice up by its Autumn ID", async () => {
 		invoice_id: "inv_123",
 		limit: 1,
 	});
+});
+
+test("an API that ignored an ID filter yields no invoices, not unrelated ones", () => {
+	const unfiltered = {
+		list: [
+			{ id: "inv_newest", stripe_id: "in_newest" },
+			{ id: "inv_older", stripe_id: "in_older" },
+		],
+		next_cursor: "cursor_1",
+	};
+
+	expect(
+		keepInvoicesMatchingIdFilters({
+			request: { stripe_id: "in_missing" },
+			result: unfiltered,
+		}),
+	).toEqual({ list: [], next_cursor: null });
+	expect(
+		keepInvoicesMatchingIdFilters({
+			request: { invoice_id: "inv_older" },
+			result: unfiltered,
+		}),
+	).toEqual({
+		list: [{ id: "inv_older", stripe_id: "in_older" }],
+		next_cursor: null,
+	});
+	expect(
+		keepInvoicesMatchingIdFilters({
+			request: { customer_id: "cus_1" },
+			result: unfiltered,
+		}),
+	).toBe(unfiltered);
+});
+
+test("getStripeInvoice looks an invoice up by its number", async () => {
+	const fetch = mock(
+		async (_url: string | URL | Request, _init?: RequestInit) =>
+			Response.json({ id: "in_123", number: "TNUX5UAX-0003", status: "open" }),
+	);
+	globalThis.fetch = fetch as unknown as typeof globalThis.fetch;
+	const tools = createRawAutumnOperationTools({ requireIntent: false });
+	const context = { mcp: { extra: { authInfo: auth } } };
+
+	const summary = await tools.getStripeInvoice?.execute?.(
+		{ invoice_number: "TNUX5UAX-0003" },
+		context as never,
+	);
+
+	expect(summary).toMatchObject({ id: "in_123", number: "TNUX5UAX-0003" });
+	const [url] = fetch.mock.calls[0] ?? [];
+	expect(new URL(String(url)).pathname).toBe(
+		"/v1/invoices/TNUX5UAX-0003/stripe",
+	);
+});
+
+test("getStripeInvoice rejects an invoice that is not the one asked for", async () => {
+	globalThis.fetch = mock(async () =>
+		Response.json({ id: "in_other", number: "OTHER-0001", status: "open" }),
+	) as unknown as typeof globalThis.fetch;
+	const tools = createRawAutumnOperationTools({ requireIntent: false });
+	const context = { mcp: { extra: { authInfo: auth } } };
+
+	await expect(
+		tools.getStripeInvoice?.execute?.(
+			{ invoice_number: "TNUX5UAX-0003" },
+			context as never,
+		) as Promise<unknown>,
+	).rejects.toThrow("not found");
+});
+
+test("getStripeInvoice takes exactly one of an ID or a number", async () => {
+	const fetch = mock(async () => Response.json({}));
+	globalThis.fetch = fetch as unknown as typeof globalThis.fetch;
+	const tools = createRawAutumnOperationTools({ requireIntent: false });
+	const context = { mcp: { extra: { authInfo: auth } } };
+	const lookUp = (input: Record<string, unknown>) =>
+		tools.getStripeInvoice?.execute?.(input as never, context as never);
+
+	await expect(lookUp({}) as Promise<unknown>).rejects.toThrow("exactly one");
+	await expect(
+		lookUp({
+			stripe_invoice_id: "in_123",
+			invoice_number: "TNUX5UAX-0003",
+		}) as Promise<unknown>,
+	).rejects.toThrow("exactly one");
+	expect(fetch).not.toHaveBeenCalled();
+
+	const schema = tools.getStripeInvoice?.inputSchema as unknown as {
+		safeParse: (value: unknown) => { success: boolean };
+	};
+	expect(schema.safeParse({ invoice_number: 'x" OR 1' }).success).toBe(false);
 });
